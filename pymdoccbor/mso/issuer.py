@@ -102,7 +102,12 @@ class MsoIssuer(MsoX509Fabric):
                         if _value_cbortag:
                             v[k2] = cbor2.CBORTag(_value_cbortag, value=v2)
 
-                if isinstance(v, list) and k != "nationality":
+                if (
+                    isinstance(v, list)
+                    and k != "nationality"
+                    and k != "codes"
+                    and k != "capacities"
+                ):
                     for item in v:
                         for k2, v2 in item.items():
                             _value_cbortag = settings.CBORTAGS_ATTR_MAP.get(k2, None)
@@ -140,19 +145,19 @@ class MsoIssuer(MsoX509Fabric):
         """
         sign a mso and returns itprivate_key
         """
-        utcnow = datetime.datetime.utcnow()
-        valid_from = datetime.datetime.strptime(
-            self.validity["issuance_date"], "%Y-%m-%d"
-        )
+        # utcnow = datetime.datetime.utcnow()
+
+        valid_from = self.validity["issuance_date"]
+
         if settings.PYMDOC_EXP_DELTA_HOURS:
-            exp = utcnow + datetime.timedelta(hours=settings.PYMDOC_EXP_DELTA_HOURS)
+            exp = valid_from + datetime.timedelta(hours=settings.PYMDOC_EXP_DELTA_HOURS)
         else:
             # five years
-            exp = datetime.datetime.strptime(self.validity["expiry_date"], "%Y-%m-%d")
+            exp = self.validity["expiry_date"]
             # exp = utcnow + datetime.timedelta(hours=(24 * 365) * 5)
 
-        if utcnow > valid_from:
-            valid_from = utcnow
+        """ if utcnow > valid_from:
+            valid_from = utcnow """
 
         alg_map = {"ES256": "SHA-256", "ES384": "SHA-384", "ES512": "SHA-512"}
 
@@ -160,10 +165,8 @@ class MsoIssuer(MsoX509Fabric):
             "docType": doctype or list(self.hash_map)[0],
             "version": "1.0",
             "validityInfo": {
-                "signed": cbor2.CBORTag(0, self.format_datetime_repr(utcnow)),
-                "validFrom": cbor2.CBORTag(
-                    0, self.format_datetime_repr(valid_from or utcnow)
-                ),
+                "signed": cbor2.CBORTag(0, self.format_datetime_repr(valid_from)),
+                "validFrom": cbor2.CBORTag(0, self.format_datetime_repr(valid_from)),
                 "validUntil": cbor2.CBORTag(0, self.format_datetime_repr(exp)),
             },
             "valueDigests": self.hash_map,
