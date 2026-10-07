@@ -43,7 +43,14 @@ def pretty_print(cbor_loaded: dict):
 
 
 def shuffle_dict(d: dict):
-    """The items of d in a random order (from a cryptographic RNG)."""
+    """The items of d in a random order.
+
+    The order sets the digest IDs of an mdoc's elements, which must not reveal
+    which element is which (ISO 18013-5), so it comes from the OS CSPRNG
+    (``secrets``): a Fisher-Yates shuffle, every order equally likely.
+    """
     keys = list(d.keys())
-    secrets.SystemRandom().shuffle(keys)
-    return dict([(key, d[key]) for key in keys])
+    for i in range(len(keys) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        keys[i], keys[j] = keys[j], keys[i]
+    return {key: d[key] for key in keys}

@@ -436,3 +436,37 @@ def test_malformed_mso_fails_without_raising(pki, tmp_path, validity, mso_value,
     valid, mdoc = verify(resign(signed, pki.ds_key, {1: -7}, payload=payload), [pki.iaca])
     assert valid is False
     assert any(error in e for e in mdoc.documents_invalid[0].errors)
+
+
+# Element order (digest IDs): from the OS CSPRNG, uniform (SonarCloud S2245).
+
+
+def test_shuffle_dict_keeps_every_item():
+    from pymdoccbor.tools import shuffle_dict
+
+    data = {f"element_{i}": i for i in range(20)}
+    assert shuffle_dict(data) == data
+
+
+def test_shuffle_dict_reaches_every_order():
+    from collections import Counter
+
+    from pymdoccbor.tools import shuffle_dict
+
+    orders = Counter(tuple(shuffle_dict({"a": 1, "b": 2, "c": 3})) for _ in range(3000))
+    assert len(orders) == 6
+    assert min(orders.values()) > 350  # 500 expected for each order
+
+
+def test_shuffle_dict_does_not_use_the_random_module(monkeypatch):
+    import random
+
+    from pymdoccbor.tools import shuffle_dict
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("random module used")
+
+    for name in ("shuffle", "randint", "random", "randrange", "choice"):
+        monkeypatch.setattr(random, name, refuse)
+    monkeypatch.setattr(random.SystemRandom, "shuffle", refuse)
+    shuffle_dict({"a": 1, "b": 2, "c": 3})
