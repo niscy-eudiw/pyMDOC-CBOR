@@ -167,16 +167,30 @@ mdoc.documents
 ````
 
 `verify()` fails closed: a document is valid only when
- - its issuer certificate chain (x5chain) is valid and leads to one of
-   `trusted_certificates` (e.g. IACA certificates; `cryptography` objects, DER or PEM);
- - the MSO signature verifies with the issuer certificate;
+ - its issuer certificate chain (x5chain) is valid and ends at, or is directly
+   issued by, one of `trusted_certificates` (e.g. IACA certificates;
+   `cryptography` objects, DER or PEM). Every certificate that issues another
+   (trust anchor included) must be a CA (BasicConstraints cA) with KeyUsage
+   keyCertSign, within its pathLenConstraint; the leaf (DS) certificate must not
+   be a CA or a trust anchor, must have KeyUsage digitalSignature if it has
+   KeyUsage, and must have the mdoc DS extended key usage `1.0.18013.5.1.2` if
+   it has an EKU extension;
+ - the MSO signature verifies with the issuer certificate; its `alg` must be in
+   the protected header, be ES256, ES384 or ES512, and match the issuer key's
+   curve (P-256, P-384, P-521);
  - every disclosed element matches its digest in the MSO;
  - the MSO `docType` is the document's `docType`;
  - the MSO is valid now (or at `at_time`).
 
 Without trusted certificates, `verify()` returns `False`. The reasons a document
-failed are in `mdoc.documents_invalid[i].errors`. Device authentication
-(`deviceSigned`) is not verified.
+failed are in `mdoc.documents_invalid[i].errors`; malformed input makes
+`verify()` return `False` rather than raise.
+
+**`verify()` authenticates the issuer data only.** Device authentication
+(`deviceSigned`: DeviceAuth over the SessionTranscript) is not implemented, so
+`verify()` does not prove that the presenter holds the device key: an
+`issuerSigned` copied from another presentation verifies. A verifier that needs
+holder binding must check DeviceAuth itself.
 
 ### Verify the Mobile Security Object
 
@@ -202,7 +216,8 @@ API usage:
  - `msop.raw_public_keys`: returns the list of the public keys from the unprotected COSE header
  - `msop.public_key`: returns `cryptography.hazmat` key.
  - `msop.x509_certificates`: returns a list of `cryptography.x509` certificate objects
- - `msop.verify_chain(trusted_certificates, at_time=None)`: the x5chain is valid and leads to a trusted certificate
+ - `msop.verify_chain(trusted_certificates, at_time=None)`: the x5chain is valid and leads to a trusted certificate (see the rules above)
+ - `msop.check_algorithm()`: the COSE `alg` is protected, supported and matches the issuer key (called by `verify_signature()`)
 
 ## Tests
 

@@ -72,12 +72,18 @@ class MobileDocument:
         """
             The document is valid when all of these hold:
             - the issuer certificate chain leads to one of trusted_certificates;
-            - the MSO signature verifies with the issuer certificate;
+            - the MSO signature (ES256, ES384 or ES512, alg in the protected
+              header) verifies with the issuer certificate;
             - every disclosed element matches its digest in the MSO;
             - the MSO docType is the document's docType;
             - the MSO is valid at at_time (default: now).
 
             Without trusted certificates the document is never valid.
+
+            This authenticates the issuer data (issuerSigned) only. Device
+            authentication (deviceSigned / DeviceAuth over the
+            SessionTranscript) is not implemented, so it does not prove the
+            presenter holds the device key: a copied issuerSigned verifies.
         """
         self.errors = []
         when = at_time or datetime.datetime.now(datetime.timezone.utc)
@@ -103,19 +109,22 @@ class MobileDocument:
 
         try:
             mso = issuer_auth.payload_as_dict
+            if not isinstance(mso, dict):
+                raise InvalidMdoc(f"the MSO is a {type(mso).__name__}, not a map")
+            if mso.get("docType") != self.doctype:
+                self.errors.append(f"MSO docType {mso.get('docType')!r} is not the document docType {self.doctype!r}")
+            validity = mso.get("validityInfo")
+            valid_from = validity.get("validFrom") if isinstance(validity, dict) else None
+            valid_until = validity.get("validUntil") if isinstance(validity, dict) else None
+            if not isinstance(valid_from, datetime.datetime) or not isinstance(valid_until, datetime.datetime):
+                self.errors.append("MSO validityInfo is malformed")
+            elif not valid_from <= when <= valid_until:
+                self.errors.append(f"MSO is not valid at {when.isoformat()} ({valid_from} - {valid_until})")
         except Exception as e:
             self.errors.append(f"MSO could not be decoded: {e}")
             mso = None
 
         if mso is not None:
-            if mso.get("docType") != self.doctype:
-                self.errors.append(f"MSO docType {mso.get('docType')!r} is not the document docType {self.doctype!r}")
-            validity = mso.get("validityInfo") or {}
-            valid_from, valid_until = validity.get("validFrom"), validity.get("validUntil")
-            if not isinstance(valid_from, datetime.datetime) or not isinstance(valid_until, datetime.datetime):
-                self.errors.append("MSO validityInfo is malformed")
-            elif not valid_from <= when <= valid_until:
-                self.errors.append(f"MSO is not valid at {when.isoformat()} ({valid_from} - {valid_until})")
             try:
                 self._check_digests(mso)
             except Exception as e:

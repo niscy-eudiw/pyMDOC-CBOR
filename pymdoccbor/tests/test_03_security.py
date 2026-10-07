@@ -5,8 +5,11 @@ import datetime
 
 import cbor2
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.x509.oid import ExtendedKeyUsageOID
 from pycose.keys import CoseKey
 
 from pymdoccbor.exceptions import MsoX509ChainNotFound
@@ -14,7 +17,7 @@ from pymdoccbor.mdoc.issuer import MdocCborIssuer
 from pymdoccbor.mdoc.verifier import MdocCbor
 from pymdoccbor.mso.issuer import MsoIssuer
 
-from .conftest import Pki, cose_private_key, make_certificate, pem_device_key
+from .conftest import MDOC_DS_EKU, Pki, cose_private_key, make_ca, make_certificate, make_ds, pem_device_key
 
 MDL = "org.iso.18013.5.1.mDL"
 NS = "org.iso.18013.5.1"
@@ -259,3 +262,177 @@ def test_trusted_certificate_formats(pki, tmp_path, validity):
     signed = issue(pki, tmp_path, validity)
     assert verify(signed, [pki.iaca.public_bytes(serialization.Encoding.DER)])[0]
     assert verify(signed, [pki.iaca.public_bytes(serialization.Encoding.PEM)])[0]
+
+
+# ------------------------------------------------------- chain validation ---
+
+
+def der(cert):
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def with_x5chain(signed, *certs):
+    """The x5chain (unprotected header, not signed) replaced by certs, leaf first."""
+    phdr, uhdr, payload, signature = signed["issuerAuth"]
+    signed = dict(signed)
+    signed["issuerAuth"] = [phdr, {**uhdr, 33: [der(c) for c in certs]}, payload, signature]
+    return signed
+
+
+class Hierarchy:
+    """IACA -> intermediate CA -> DS, with the DS key from pki."""
+
+    def __init__(self, pki, iaca_path_length=1, intermediate=None, ds=None):
+        self.iaca_key = ec.generate_private_key(ec.SECP256R1())
+        self.iaca = make_ca(self.iaca_key, "Test IACA", path_length=iaca_path_length)
+        self.int_key = ec.generate_private_key(ec.SECP256R1())
+        self.int = (intermediate or (lambda k, ik: make_ca(k, "Test INT", ik, "Test IACA", path_length=0)))(self.int_key, self.iaca_key)
+        self.ds = (ds or (lambda k, ik: make_ds(k, "Test DS", ik, "Test INT")))(pki.ds_key, self.int_key)
+        pki.ds = self.ds
+
+
+def test_chain_with_intermediate_ca_verifies(pki, tmp_path, validity):
+    h = Hierarchy(pki)
+    valid, mdoc = verify(with_x5chain(issue(pki, tmp_path, validity), h.ds, h.int), [h.iaca])
+    assert valid, mdoc.documents_invalid[0].errors
+
+
+@pytest.mark.parametrize(
+    "intermediate",
+    [
+        lambda k, ik: make_certificate(k, "Test INT", ik, "Test IACA", ca=False, key_usage={"key_cert_sign"}),
+        lambda k, ik: make_certificate(k, "Test INT", ik, "Test IACA", basic_constraints=False, key_usage={"key_cert_sign"}),
+        lambda k, ik: make_ca(k, "Test INT", ik, "Test IACA", key_usage=None),
+        lambda k, ik: make_ca(k, "Test INT", ik, "Test IACA", key_usage={"digital_signature", "crl_sign"}),
+    ],
+    ids=["not-ca", "no-basic-constraints", "no-key-usage", "no-key-cert-sign"],
+)
+def test_issuing_certificate_must_be_a_ca(pki, tmp_path, validity, intermediate):
+    h = Hierarchy(pki, intermediate=intermediate)
+    assert verify(with_x5chain(issue(pki, tmp_path, validity), h.ds, h.int), [h.iaca])[0] is False
+
+
+def test_trust_anchor_must_be_a_ca_with_key_cert_sign(pki, tmp_path, validity):
+    pki.iaca = make_certificate(pki.iaca_key, "Test IACA", ca=True, key_usage={"crl_sign"})
+    assert verify(issue(pki, tmp_path, validity), [pki.iaca])[0] is False
+
+
+def test_trust_anchor_path_length(pki, tmp_path, validity):
+    h = Hierarchy(pki, iaca_path_length=0)
+    assert verify(with_x5chain(issue(pki, tmp_path, validity), h.ds, h.int), [h.iaca])[0] is False
+
+
+def test_intermediate_path_length(pki, tmp_path, validity):
+    h = Hierarchy(pki, iaca_path_length=None)
+    int2_key = ec.generate_private_key(ec.SECP256R1())
+    int2 = make_ca(int2_key, "Test INT2", h.int_key, "Test INT")  # h.int has pathLenConstraint 0
+    pki.ds = make_ds(pki.ds_key, "Test DS", int2_key, "Test INT2")
+    assert verify(with_x5chain(issue(pki, tmp_path, validity), pki.ds, int2, h.int), [h.iaca])[0] is False
+
+
+@pytest.mark.parametrize(
+    "ds_kwargs",
+    [
+        {"ca": True, "key_usage": {"digital_signature", "key_cert_sign"}},
+        {"key_usage": {"key_cert_sign"}},
+        {"key_usage": {"key_agreement"}},
+        {"eku": [ExtendedKeyUsageOID.SERVER_AUTH]},
+        {"eku": [ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE]},
+    ],
+    ids=["ca", "key-cert-sign-only", "key-agreement-only", "eku-server-auth", "eku-any"],
+)
+def test_document_signer_certificate_profile(pki, tmp_path, validity, ds_kwargs):
+    pki.ds = make_ds(pki.ds_key, "Test DS", pki.iaca_key, "Test IACA", **ds_kwargs)
+    assert verify(issue(pki, tmp_path, validity), [pki.iaca])[0] is False
+
+
+@pytest.mark.parametrize(
+    "ds_kwargs",
+    [{"key_usage": None, "eku": None}, {"basic_constraints": False}, {"eku": [ExtendedKeyUsageOID.SERVER_AUTH, MDOC_DS_EKU]}],
+    ids=["no-key-usage-no-eku", "no-basic-constraints", "eku-includes-mdoc-ds"],
+)
+def test_document_signer_optional_extensions(pki, tmp_path, validity, ds_kwargs):
+    pki.ds = make_ds(pki.ds_key, "Test DS", pki.iaca_key, "Test IACA", **ds_kwargs)
+    valid, mdoc = verify(issue(pki, tmp_path, validity), [pki.iaca])
+    assert valid, mdoc.documents_invalid[0].errors
+
+
+def test_trust_anchor_is_not_accepted_as_leaf(pki, tmp_path, validity):
+    """The issuer signs with the IACA key and sends the IACA as its x5chain."""
+    signed = issue(pki, tmp_path, validity, signer=pki.iaca_key, cert=der(pki.iaca))
+    assert verify(signed, [pki.iaca])[0] is False
+
+
+def test_chain_must_end_at_or_below_a_trust_anchor(pki, tmp_path, validity):
+    """The DS is issued by the IACA key, but the chain continues to an untrusted root."""
+    rogue_key = ec.generate_private_key(ec.SECP256R1())
+    rogue_root = make_ca(rogue_key, "Rogue Root")
+    cross_signed_iaca = make_ca(pki.iaca_key, "Test IACA", rogue_key, "Rogue Root")
+    signed = with_x5chain(issue(pki, tmp_path, validity), pki.ds, cross_signed_iaca, rogue_root)
+    assert verify(signed, [pki.iaca])[0] is False
+
+
+# ------------------------------------------------------------- COSE alg ---
+
+
+def resign(signed, key, phdr, uhdr=None, hash_alg=None, payload=None):
+    """issuerAuth signed again by key with the given headers (and payload)."""
+    phdr_bytes = cbor2.dumps(phdr) if phdr else b""
+    _, old_uhdr, old_payload, _ = signed["issuerAuth"]
+    payload = old_payload if payload is None else payload
+    to_sign = cbor2.dumps(["Signature1", phdr_bytes, b"", payload])
+    r, s = decode_dss_signature(key.sign(to_sign, ec.ECDSA(hash_alg or hashes.SHA256())))
+    size = (key.curve.key_size + 7) // 8
+    signed = dict(signed)
+    signed["issuerAuth"] = [phdr_bytes, {**old_uhdr, **(uhdr or {})}, payload, r.to_bytes(size, "big") + s.to_bytes(size, "big")]
+    return signed
+
+
+def test_resigned_mdoc_verifies(pki, tmp_path, validity):
+    """Control for the tests below: the helper produces a valid signature."""
+    signed = resign(issue(pki, tmp_path, validity), pki.ds_key, {1: -7})
+    valid, mdoc = verify(signed, [pki.iaca])
+    assert valid, mdoc.documents_invalid[0].errors
+
+
+@pytest.mark.parametrize(
+    "phdr, uhdr, hash_alg",
+    [
+        ({}, {1: -7}, hashes.SHA256()),  # alg only in the unprotected header
+        ({1: -7}, {1: -7}, hashes.SHA256()),  # alg in both headers
+        ({1: -35}, None, hashes.SHA384()),  # ES384 with a P-256 key
+        ({1: -36}, None, hashes.SHA512()),  # ES512 with a P-256 key
+        ({1: -8}, None, hashes.SHA256()),  # EdDSA
+        ({1: 5}, None, hashes.SHA256()),  # HS256
+        ({}, None, hashes.SHA256()),  # no alg
+    ],
+    ids=["unprotected-only", "both-headers", "es384-p256", "es512-p256", "eddsa", "hs256", "missing"],
+)
+def test_cose_alg_must_be_protected_and_match_the_key(pki, tmp_path, validity, phdr, uhdr, hash_alg):
+    signed = resign(issue(pki, tmp_path, validity), pki.ds_key, phdr, uhdr, hash_alg)
+    valid, mdoc = verify(signed, [pki.iaca])
+    assert valid is False
+    # Rejected for its alg, not by chance inside pycose.
+    assert any("COSE alg" in e for e in mdoc.documents_invalid[0].errors)
+
+
+# ---------------------------------------------------- malformed MSO input ---
+
+
+@pytest.mark.parametrize(
+    "mso_value, error",
+    [
+        ([1, 2, 3], "not a map"),
+        ("mso", "not a map"),
+        (lambda m: {**m, "validityInfo": ["2020-01-01"]}, "validityInfo"),
+        (lambda m: {**m, "validityInfo": None}, "validityInfo"),
+    ],
+    ids=["list", "string", "validity-info-list", "validity-info-missing"],
+)
+def test_malformed_mso_fails_without_raising(pki, tmp_path, validity, mso_value, error):
+    signed = issue(pki, tmp_path, validity)
+    value = mso_value(mso(signed)) if callable(mso_value) else mso_value
+    payload = cbor2.dumps(cbor2.CBORTag(24, cbor2.dumps(value)))
+    valid, mdoc = verify(resign(signed, pki.ds_key, {1: -7}, payload=payload), [pki.iaca])
+    assert valid is False
+    assert any(error in e for e in mdoc.documents_invalid[0].errors)

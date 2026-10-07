@@ -11,8 +11,12 @@ ISSUED_MDOC = "a36776657273696f6e63312e3069646f63756d656e747381a367646f635479706
 
 
 # ISO/IEC 18013-5 sample: its MSO and DS certificate are valid from 2020-10-01 to
-# 2021-10-01, and its IACA is not included, so the DS certificate is the anchor.
+# 2021-10-01, and its IACA is not included. Its DS certificate is given as the
+# trust anchor, which verify_chain refuses (a trust anchor is never the leaf):
+# the chain is then the sample's only error, so the signature, the digests, the
+# docType and the validity period are still checked.
 SAMPLE_TIME = datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc)
+CHAIN_ERROR = "issuer certificate chain is not trusted or not valid"
 
 
 def sample_ds_certificate() -> bytes:
@@ -20,15 +24,16 @@ def sample_ds_certificate() -> bytes:
     return issuer_auth[1][33]
 
 
+def sample_errors(mdoc: MdocCbor) -> list:
+    assert mdoc.verify(trusted_certificates=[sample_ds_certificate()], at_time=SAMPLE_TIME) is False
+    assert len(mdoc.documents_invalid) == 1
+    return mdoc.documents_invalid[0].errors
+
+
 def test_parse_mdoc_af_binary():
     mdoc = MdocCbor()
     mdoc.loads(ISSUED_MDOC)
-    assert mdoc.verify(trusted_certificates=[sample_ds_certificate()], at_time=SAMPLE_TIME)
-
-    for i in mdoc.documents:
-        assert i.is_valid
-
-    assert len(mdoc.documents) == 1
+    assert sample_errors(mdoc) == [CHAIN_ERROR]
 
     # testing format outputs
     assert type(mdoc.data_as_string) == str
@@ -38,12 +43,7 @@ def test_parse_mdoc_af_binary():
     # testing from export re-import
     mdoc2 = MdocCbor()
     mdoc2.loads(mdoc.data_as_bytes)
-    assert mdoc2.verify(trusted_certificates=[sample_ds_certificate()], at_time=SAMPLE_TIME)
-
-    for i in mdoc.documents:
-        assert i.is_valid
-
-    assert len(mdoc.documents) == 1
+    assert sample_errors(mdoc2) == [CHAIN_ERROR]
     
     # test repr
     mdoc.__repr__()
@@ -65,7 +65,7 @@ def test_parse_mdoc_break():
     mdoc_break = MdocCbor()
     mdoc_break.loads(_breaked_mso)
 
-    assert mdoc_break.verify(trusted_certificates=[sample_ds_certificate()], at_time=SAMPLE_TIME) is False
+    assert "issuer signature is invalid" in sample_errors(mdoc_break)
     assert mdoc_break.documents_invalid[0].is_valid is False
 
 
