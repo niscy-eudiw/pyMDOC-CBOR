@@ -1,21 +1,48 @@
+import datetime
+import logging
+from typing import Iterable, Optional, Union
+
 import cbor2
 import cryptography
-import logging
-
-from pycose.keys import CoseKey, EC2Key
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec
+from pycose.keys import EC2Key
 from pycose.messages import Sign1Message
 
-from typing import Optional
-
-from pymdoccbor.exceptions import (
-    MsoX509ChainNotFound,
-    UnsupportedMsoDataFormat
-)
 from pymdoccbor import settings
+from pymdoccbor.exceptions import MsoX509ChainNotFound, UnsupportedMsoDataFormat
 from pymdoccbor.tools import bytes2CoseSign1, cborlist2CoseSign1
 
-
 logger = logging.getLogger("pymdoccbor")
+
+X5CHAIN = 33
+
+
+def load_trusted_certificate(cert: Union[x509.Certificate, bytes, str]) -> x509.Certificate:
+    """A trust anchor given as a certificate object, DER or PEM."""
+    if isinstance(cert, x509.Certificate):
+        return cert
+    if isinstance(cert, str):
+        cert = cert.encode()
+    if cert.lstrip().startswith(b"-----BEGIN"):
+        return x509.load_pem_x509_certificate(cert)
+    return x509.load_der_x509_certificate(cert)
+
+
+def _valid_at(cert: x509.Certificate, when: datetime.datetime) -> bool:
+    utc = datetime.timezone.utc
+    # cryptography < 42 only has the naive (UTC) properties
+    before = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=utc)
+    after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=utc)
+    return before <= when <= after
+
+
+def _issued_by(cert: x509.Certificate, issuer: x509.Certificate) -> bool:
+    try:
+        cert.verify_directly_issued_by(issuer)
+        return True
+    except Exception:
+        return False
 
 
 class MsoVerifier:
@@ -44,8 +71,8 @@ class MsoVerifier:
                 f"MsoParser only supports raw bytes and list, a {type(data)} was provided"
             )
 
-        self.object.key: Optional[CoseKey, None] = None
-        self.public_key: cryptography.hazmat.backends.openssl.ec._EllipticCurvePublicKey = None
+        self.object.key: Optional[EC2Key] = None
+        self.public_key: Optional[ec.EllipticCurvePublicKey] = None
         self.x509_certificates: list = []
 
     @property
@@ -66,47 +93,71 @@ class MsoVerifier:
         )
 
     @property
-    def raw_public_keys(self) -> bytes:
+    def raw_public_keys(self) -> list:
         """
-            it returns the public key extract from x509 certificates
-            looking to both phdr and uhdr
+            the DER certificates of the x5chain header (label 33), leaf first,
+            from the protected or the unprotected header
         """
-        _mixed_heads = self.object.phdr.items() | self.object.uhdr.items()
-        for h, v in _mixed_heads:
-            if h.identifier == 33:
-                return list(self.object.uhdr.values())
+        for headers in (self.object.phdr, self.object.uhdr):
+            for h, v in headers.items():
+                if getattr(h, "identifier", h) == X5CHAIN:
+                    return list(v) if isinstance(v, list) else [v]
 
         raise MsoX509ChainNotFound(
             "I can't find any valid X509certs, identified by label number 33, "
             "in this MSO."
         )
 
-    def attest_public_key(self):
-        logger.warning(
-            "TODO: in next releases. "
-            "The certificate is to be considered as untrusted, this release "
-            "doesn't validate x.509 certificate chain. See next releases and "
-            "python certvalidator or cryptography for that."
-        )
-
     def load_public_key(self):
-
-        self.attest_public_key()
-
-        for i in self.raw_public_keys:
-            self.x509_certificates.append(
-                cryptography.x509.load_der_x509_certificate(i)
-            )
+        self.x509_certificates = [
+            cryptography.x509.load_der_x509_certificate(i) for i in self.raw_public_keys
+        ]
 
         self.public_key = self.x509_certificates[0].public_key()
-
-        key = EC2Key(
-            crv=settings.COSEKEY_HAZMAT_CRV_MAP[self.public_key.curve.name],
-            x=self.public_key.public_numbers().x.to_bytes(
-                settings.CRV_LEN_MAP[self.public_key.curve.name], 'big'
-            )
+        if not isinstance(self.public_key, ec.EllipticCurvePublicKey):
+            raise UnsupportedMsoDataFormat("The issuer certificate does not hold an EC key")
+        curve = self.public_key.curve.name
+        if curve not in settings.COSEKEY_HAZMAT_CRV_MAP:
+            raise UnsupportedMsoDataFormat(f"Unsupported issuer key curve: {curve}")
+        size = settings.CRV_LEN_MAP[curve]
+        numbers = self.public_key.public_numbers()
+        self.object.key = EC2Key(
+            crv=settings.COSEKEY_HAZMAT_CRV_MAP[curve],
+            x=numbers.x.to_bytes(size, "big"),
+            y=numbers.y.to_bytes(size, "big"),
         )
-        self.object.key = key
+
+    def verify_chain(
+        self,
+        trusted_certificates: Iterable[Union[x509.Certificate, bytes, str]],
+        at_time: Optional[datetime.datetime] = None,
+    ) -> bool:
+        """
+            The x5chain is valid at at_time (default: now), each certificate is
+            issued by the next one, and the chain contains or is issued by one
+            of the trusted certificates (e.g. an IACA).
+        """
+        when = at_time or datetime.datetime.now(datetime.timezone.utc)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        if not self.x509_certificates:
+            self.load_public_key()
+        chain = self.x509_certificates
+
+        for position, cert in enumerate(chain):
+            if not _valid_at(cert, when):
+                logger.warning(f"Issuer certificate {position} is not valid at {when.isoformat()}")
+                return False
+            if position + 1 < len(chain) and not _issued_by(cert, chain[position + 1]):
+                logger.warning(f"Issuer certificate {position} is not issued by certificate {position + 1}")
+                return False
+
+        for anchor in (load_trusted_certificate(c) for c in trusted_certificates or []):
+            if not _valid_at(anchor, when):
+                continue
+            if any(cert == anchor or _issued_by(cert, anchor) for cert in chain):
+                return True
+        return False
 
     def verify_signature(self) -> bool:
 

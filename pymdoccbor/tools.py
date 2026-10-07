@@ -1,6 +1,6 @@
 import cbor2
 import json
-import random
+import secrets
 
 
 from cbor2.tool import (
@@ -43,10 +43,7 @@ def pretty_print(cbor_loaded: dict):
 
 
 def shuffle_dict(d: dict):
-
+    """The items of d in a random order (from a cryptographic RNG)."""
     keys = list(d.keys())
-
-    for i in range(random.randint(3, 27)):  # nosec: B311
-        random.shuffle(keys)
-
+    secrets.SystemRandom().shuffle(keys)
     return dict([(key, d[key]) for key in keys])
