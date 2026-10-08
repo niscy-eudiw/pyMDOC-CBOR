@@ -9,6 +9,7 @@
 - Documented in the README and in `verify()` that it authenticates the issuer data only: device authentication (DeviceAuth over the SessionTranscript) is not implemented, so a copied `issuerSigned` verifies.
 
 ### Fixed
+- `MsoIssuer.sign(valid_from=...)` was accepted and then overwritten by the issuance date. It now sets `validFrom` (default: the issuance date, as before; `signed` stays the issuance date) and must not be before the issuance date (ISO 18013-5 9.1.2.4). The default doctype uses `next(iter(...))` instead of `list(...)[0]` (SonarCloud).
 - `MobileDocument.verify()` raised on an MSO that is not a map or whose `validityInfo` is not a map; it now returns `False` with the error recorded.
 
 ## [0.6.0]

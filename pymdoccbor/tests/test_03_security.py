@@ -153,6 +153,35 @@ def test_validity_tdates(pki, tmp_path, tz):
     assert f"validFrom\xc0t{expected}".encode("latin-1") in payload
 
 
+def _mso_validity(pki, tmp_path, validity, **sign_args):
+    msoi = MsoIssuer(data=mdl_data(), validity=validity, private_key=cose_private_key(pki.ds_key),
+                     cert_path=pki.write_ds(tmp_path / "ds.der"))
+    signed = msoi.sign(device_key=cbor2.loads(cbor2.dumps({1: 2})), doctype=MDL, **sign_args)
+    return cbor2.loads(cbor2.loads(signed.payload).value)["validityInfo"]
+
+
+def test_valid_from_defaults_to_the_issuance_date(pki, tmp_path):
+    start = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    info = _mso_validity(pki, tmp_path, {"issuance_date": start, "expiry_date": start + datetime.timedelta(days=1)})
+    assert info["signed"] == info["validFrom"] == datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_valid_from_is_used_when_given(pki, tmp_path):
+    """sign(valid_from=...) was accepted and then ignored."""
+    start = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    later = start + datetime.timedelta(hours=6)
+    info = _mso_validity(pki, tmp_path, {"issuance_date": start, "expiry_date": start + datetime.timedelta(days=1)},
+                         valid_from=later)
+    assert info["signed"] == start and info["validFrom"] == later
+
+
+def test_valid_from_before_signed_is_refused(pki, tmp_path):
+    start = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    with pytest.raises(ValueError, match="valid_from must not be before"):
+        _mso_validity(pki, tmp_path, {"issuance_date": start, "expiry_date": start + datetime.timedelta(days=1)},
+                      valid_from=start - datetime.timedelta(hours=1))
+
+
 def test_validity_must_be_ordered(pki, tmp_path, validity):
     validity["expiry_date"] = validity["issuance_date"] - datetime.timedelta(days=1)
     with pytest.raises(ValueError, match="validity"):

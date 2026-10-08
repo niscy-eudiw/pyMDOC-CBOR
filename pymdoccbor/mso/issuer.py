@@ -200,24 +200,32 @@ class MsoIssuer(MsoX509Fabric):
     ) -> Sign1Message:
         """
         sign a mso and returns it
+
+        :param valid_from: start of validity (``validFrom``) when it is later
+            than the issuance date (``signed``); default the issuance date.
+            It was accepted and then ignored before.
         """
         try:
-            valid_from = self.validity["issuance_date"]
+            signed = self.validity["issuance_date"]
             exp = self.validity["expiry_date"]
         except (KeyError, TypeError):
             raise ValueError("MSO validity requires issuance_date and expiry_date")
+        valid_from = valid_from or signed
 
         if settings.PYMDOC_EXP_DELTA_HOURS:
             exp = valid_from + datetime.timedelta(hours=settings.PYMDOC_EXP_DELTA_HOURS)
 
+        # ISO 18013-5 9.1.2.4: validFrom is not before signed, validUntil after validFrom.
+        if self.format_datetime_repr(valid_from) < self.format_datetime_repr(signed):
+            raise ValueError("MSO validity: valid_from must not be before issuance_date")
         if self.format_datetime_repr(exp) <= self.format_datetime_repr(valid_from):
             raise ValueError("MSO validity: expiry_date must be after issuance_date")
 
         payload = {
-            "docType": doctype or list(self.hash_map)[0],
+            "docType": doctype or next(iter(self.hash_map)),
             "version": "1.0",
             "validityInfo": {
-                "signed": cbor2.CBORTag(0, self.format_datetime_repr(valid_from)),
+                "signed": cbor2.CBORTag(0, self.format_datetime_repr(signed)),
                 "validFrom": cbor2.CBORTag(0, self.format_datetime_repr(valid_from)),
                 "validUntil": cbor2.CBORTag(0, self.format_datetime_repr(exp)),
             },
